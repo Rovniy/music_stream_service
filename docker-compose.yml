@@ -6,4 +6,4 @@ services:
     image: xploitravy/music_stream
     env_file:
       - .env
-    restart: always
+    restart: unless-stopped
