@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Clone repo
+      - name: Restart Docker containers
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.BOT_SERVER_HOST }}
@@ -18,24 +18,13 @@ jobs:
           key: ${{ secrets.BOT_SERVER_SSH_KEY }}
           script: |
             cd /home/music_stream
-            git pull https://Rovniy:${{ secrets.GIT_USER_TOKEN }}@github.com/Rovniy/music_stream_service.git
+            docker-compose stop music_stream
+            docker-compose pull music_stream
+            docker-compose up -d
 
-      # Шаг 1: Проверка исходного кода
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      # Шаг 2: Настраиваем SSH-агент для подключения к VPS
-      - name: Set up SSH agent
-        uses: webfactory/ssh-agent@v0.5.3
-        with:
-          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
-
-      # Шаг 3: Копирование файлов на VPS с помощью rsync
-      - name: Copy project to VPS
+      - name: Send Discord notification
         run: |
-          rsync -avz --delete --exclude='.git*' . ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/home/music_stream
-
-      # Шаг 4: Выполнение docker-compose на VPS для сборки и запуска контейнера
-      - name: Deploy via docker-compose
-        run: |
-          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} "cd /home/music_stream && docker-compose down && docker-compose up -d --build"
+          LAST_COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"content\": \"@music_stream service updated! Listen on Youtube - https://www.youtube.com/@zynthar_official. Commit: $LAST_COMMIT_MESSAGE\"}" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}

@@ -1,10 +1,9 @@
 version: "3.8"
 
 services:
-  stream-app:
+  music_stream:
+    container_name: music_stream
     image: xploitravy/music_stream
-    ports:
-      - "3000:3000"
     env_file:
       - .env
     restart: always
