@@ -24,7 +24,6 @@ jobs:
 
       - name: Send Discord notification
         run: |
-          LAST_COMMIT_MESSAGE=$(git log -1 --pretty=%B)
           curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": \"@music_stream service updated! Listen on Youtube - https://www.youtube.com/@zynthar_official. Commit: $LAST_COMMIT_MESSAGE\"}" \
+            -d "{\"content\": \"@music_stream service updated! Listen on Youtube - https://www.youtube.com/@zynthar_official.\"}" \
             ${{ secrets.DISCORD_WEBHOOK_URL }}
