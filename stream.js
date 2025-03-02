@@ -97,7 +97,22 @@ async function getChannelVideos() {
 			order: 'date'
 		});
 		const videoIds = response.data.items.map(item => item.id.videoId);
-		return await getVideoDetails(videoIds);
+		const videoDetails = await getVideoDetails(videoIds);
+
+		// Фильтрация: исключаем короткие видео (Shorts) и подкасты
+		return videoDetails.filter(video => {
+			const durationSec = parseDuration(video.duration);
+			// Если длительность меньше 60 секунд, считаем видео шортом
+			if (durationSec < 60) return false;
+			if (durationSec > 300) return false;
+
+			// Если в названии содержится слово "подкаст" или "podcast" (без учёта регистра) – исключаем
+			const titleLower = video.title.toLowerCase();
+			if (titleLower.includes('live') || titleLower.includes('podcast')) return false;
+
+			// Остальные видео оставляем
+			return true;
+		});
 	} catch (error) {
 		console.error('Error fetching video list:', error);
 		return [];
