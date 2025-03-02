@@ -253,56 +253,68 @@ async function startStreaming() {
 		log.info(`Target file: ${currentFile}`);
 		log.info(`Planned video duration: ${currentVideo.duration} seconds`);
 
-		let attempt = 0;
 		async function tryDownloadAndStream() {
-			try {
-				await fs.unlink(currentFile).catch(() => {});
-				if (nextDownloadPromise && nextVideoIndex === index) {
-					log.info(`Using preloaded file for video at index ${index}`);
-					await nextDownloadPromise;
-					nextDownloadPromise = null;
-				} else {
-					log.info(`Downloading video: ${currentVideo.url}`);
-					activeDownloadProcess = null;
-					const outputPath = await downloadVideo(currentVideo.url, currentFile);
-					activeDownloadProcess = null;
-				}
-				const accurateDuration = await getFileDuration(currentFile);
-				log.info(`Exact video duration (from file): ${accurateDuration} seconds`);
+			// Определяем путь для текущего видео
+			let currentFile = path.join(TEMP_DIR, `video_${index}.mkv`);
 
-				const startTime = Date.now();
-				await new Promise((resolve, reject) => {
-					const command = ffmpeg(currentFile)
-						.inputOptions('-re')
-						.outputOptions([
-							'-c:v libx264',
-							'-preset veryfast',
-							'-r 30',
-							'-g 60',
-							'-b:v 2000k',
-							'-c:a aac',
-							'-b:a 128k',
-							'-f flv'
-						])
-						.output(RTMP_URL);
+			if (nextDownloadPromise && nextVideoIndex === index) {
+				log.info(`Using preloaded file for video at index ${index}`);
+				// Если файл был предзагружен, используем именно тот путь
+				currentFile = nextVideoPath;
+				// Ждём завершения предзагрузки
+				await nextDownloadPromise;
+				nextDownloadPromise = null;
+				nextVideoIndex = null;
+				nextVideoPath = null;
+			} else {
+				// Если файла нет, пытаемся удалить (игнорируем ошибку ENOENT)
+				await fs.unlink(currentFile).catch(err => {
+					if (err.code !== 'ENOENT') {
+						log.error('Error deleting temp file before download:', err);
+					}
+				});
+				log.info(`Downloading video: ${currentVideo.url}`);
+				await downloadVideo(currentVideo.url, currentFile);
+			}
 
-					command.on('error', (err) => {
-						log.error('FFmpeg error during streaming:', err.message);
-						resolve();
-					});
-					command.on('start', (cmdLine) => {
-						log.info('FFmpeg process started:', cmdLine);
-					});
-					command.on('end', () => {
-						log.info('FFmpeg process ended normally for video:', currentVideo.url);
-						resolve();
-					});
+			// Определяем точную длительность файла
+			const accurateDuration = await getFileDuration(currentFile);
+			log.info(`Exact video duration (from file): ${accurateDuration} seconds`);
 
-					currentFFmpegProcess = command;
-					command.run();
+			const startTime = Date.now();
+			await new Promise((resolve) => {
+				const command = ffmpeg(currentFile)
+					.inputOptions('-re')
+					.outputOptions([
+						'-c:v libx264',
+						'-preset veryfast',
+						'-r 30',
+						'-g 60',
+						'-b:v 2000k',
+						'-c:a aac',
+						'-b:a 128k',
+						'-f flv'
+					])
+					.output(RTMP_URL);
 
-					if (shuttingDown) return;
-					let nextIndex = (index + 1) % shuffledPlaylist.length;
+				command.on('error', (err) => {
+					log.error('FFmpeg error during streaming:', err.message);
+					resolve();
+				});
+				command.on('start', (cmdLine) => {
+					log.info('FFmpeg process started:', cmdLine);
+				});
+				command.on('end', () => {
+					log.info('FFmpeg process ended normally for video:', currentVideo.url);
+					resolve();
+				});
+
+				currentFFmpegProcess = command;
+				command.run();
+
+				// Если не происходит завершения приложения, предзагружаем следующее видео
+				if (!shuttingDown) {
+					const nextIndex = (index + 1) % shuffledPlaylist.length;
 					if (shuffledPlaylist.length > 0 && nextIndex !== index) {
 						const nextVideo = shuffledPlaylist[nextIndex];
 						nextVideoIndex = nextIndex;
@@ -313,52 +325,28 @@ async function startStreaming() {
 							throw err;
 						});
 					}
-				});
-
-				const elapsedTime = (Date.now() - startTime) / 1000;
-				const remainingTime = Math.max(accurateDuration - elapsedTime, 0);
-				if (remainingTime > 1) {
-					log.info(`Waiting ${remainingTime.toFixed(2)} seconds to synchronize with video duration`);
-					await new Promise(res => setTimeout(res, remainingTime * 1000));
-				} else {
-					log.info('No synchronization wait needed (playback duration met or exceeded expected length)');
 				}
+			});
 
-				await fs.unlink(currentFile).catch(err => log.error('Error deleting temp file:', err));
-				log.info(`Finished streaming "${currentVideo.title}". Moving to next video...`);
-				await streamVideos(index + 1, retries);
-			} catch (error) {
-				attempt++;
-				if (attempt < retries) {
-					log.warn(`Attempt ${attempt} failed for video ${currentVideo.url}. Retrying (attempt ${attempt + 1} of ${retries})...`);
-					if (nextDownloadPromise && nextVideoIndex === index + 1) {
-						if (activeDownloadProcess) {
-							try {
-								activeDownloadProcess.kill();
-								log.warn('Aborted preloading of next video due to retry.');
-							} catch (killErr) {
-								log.error('Error aborting preloading process:', killErr);
-							}
-						}
-						if (nextVideoPath) {
-							await fs.unlink(nextVideoPath).catch(() => {});
-						}
-						nextDownloadPromise = null;
-						nextVideoIndex = null;
-						nextVideoPath = null;
-					}
-					await fs.unlink(currentFile).catch(() => {});
-					await new Promise(res => setTimeout(res, 10000));
-					await tryDownloadAndStream();
-				} else {
-					log.error(`All ${retries} attempts failed for video: ${currentVideo.url}. Skipping this video.`);
-					await fs.unlink(currentFile).catch(() => {});
-					await streamVideos(index + 1, retries);
-				}
-			} finally {
-				currentFFmpegProcess = null;
+			const elapsedTime = (Date.now() - startTime) / 1000;
+			const remainingTime = Math.max(accurateDuration - elapsedTime, 0);
+			if (remainingTime > 1) {
+				log.info(`Waiting ${remainingTime.toFixed(2)} seconds to synchronize with video duration`);
+				await new Promise(res => setTimeout(res, remainingTime * 1000));
+			} else {
+				log.info('No synchronization wait needed (playback duration met or exceeded expected length)');
 			}
+
+			// Удаляем файл после стриминга, игнорируя ошибку, если файл не найден
+			await fs.unlink(currentFile).catch(err => {
+				if (err.code !== 'ENOENT') {
+					log.error('Error deleting temp file:', err);
+				}
+			});
+			log.info(`Finished streaming "${currentVideo.title}". Moving to next video...`);
+			await streamVideos(index + 1, retries);
 		}
+
 
 		await tryDownloadAndStream();
 	}
