@@ -3,24 +3,34 @@ require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
 const ffmpeg = require('fluent-ffmpeg');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
 const app = express();
 
-// Configuration
+// **Configuration**
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const RTMP_URL = process.env.RTMP_URL;
 const TEMP_DIR = path.join(__dirname, 'temp');
 
-// Initialize YouTube API
+// **Initialize YouTube API client**
 const youtube = google.youtube({
 	version: 'v3',
 	auth: YOUTUBE_API_KEY
 });
 
-// Create and clear temporary directory
+// **Simple logger with timestamps**
+function timestamp() {
+	return new Date().toISOString();
+}
+const log = {
+	info: (...args) => console.log(`[${timestamp()}] [INFO]`, ...args),
+	warn: (...args) => console.warn(`[${timestamp()}] [WARN]`, ...args),
+	error: (...args) => console.error(`[${timestamp()}] [ERROR]`, ...args)
+};
+
+// **Create and clear temporary directory**
 async function ensureTempDir() {
 	try {
 		await fs.mkdir(TEMP_DIR, { recursive: true });
@@ -28,20 +38,30 @@ async function ensureTempDir() {
 		for (const file of files) {
 			await fs.unlink(path.join(TEMP_DIR, file)).catch(() => {});
 		}
+		log.info('Temporary directory prepared:', TEMP_DIR);
 	} catch (error) {
-		console.error('Error preparing temporary directory:', error);
+		log.error('Error preparing temporary directory:', error);
 	}
 }
 
-// Get video duration via yt-dlp
+// **Get video duration via yt-dlp using spawn**
 async function getVideoDuration(url) {
 	return new Promise((resolve) => {
-		exec(`yt-dlp --get-duration "${url}"`, (error, stdout, stderr) => {
-			if (error || !stdout.trim()) {
-				console.warn(`Error obtaining duration via yt-dlp (${url}): ${stderr}`);
+		const ytProcess = spawn('yt-dlp', ['--get-duration', url]);
+		let output = '';
+		let errorOutput = '';
+		ytProcess.stdout.on('data', (data) => {
+			output += data.toString();
+		});
+		ytProcess.stderr.on('data', (data) => {
+			errorOutput += data.toString();
+		});
+		ytProcess.on('close', (code) => {
+			if (code !== 0 || !output.trim()) {
+				log.warn(`Error obtaining duration via yt-dlp for ${url}: ${errorOutput.trim()}`);
 				resolve(null);
 			} else {
-				const durationStr = stdout.trim();
+				const durationStr = output.trim();
 				const parts = durationStr.split(':');
 				let seconds = 0;
 				if (parts.length === 3) {
@@ -57,13 +77,13 @@ async function getVideoDuration(url) {
 	});
 }
 
-// Get duration from file via FFmpeg
+// **Get duration from file using FFprobe**
 async function getFileDuration(filePath) {
 	return new Promise((resolve) => {
 		ffmpeg.ffprobe(filePath, (err, metadata) => {
 			if (err) {
-				console.error(`Error getting duration from file (${filePath}): ${err.message}`);
-				resolve(30); // Default minimum duration
+				log.error(`Error getting duration from file (${filePath}): ${err.message}`);
+				resolve(30); // Default to 30 seconds
 			} else {
 				const duration = Math.ceil(metadata.format.duration);
 				resolve(duration);
@@ -72,21 +92,36 @@ async function getFileDuration(filePath) {
 	});
 }
 
-// Download video using yt-dlp
+// **Download video using yt-dlp**
 async function downloadVideo(url, outputPath) {
 	return new Promise((resolve, reject) => {
-		exec(`yt-dlp -o "${outputPath}" -f bestvideo+bestaudio/best --no-part --no-cache-dir --merge-output-format mkv --force-overwrites "${url}"`, (error, stdout, stderr) => {
-			if (error) {
-				console.error(`Error downloading video (${url}): ${stderr}`);
-				reject(error);
+		const args = [
+			'-o', outputPath,
+			'-f', 'bestvideo+bestaudio/best',
+			'--no-part',
+			'--no-cache-dir',
+			'--merge-output-format', 'mkv',
+			'--force-overwrites',
+			url
+		];
+		const dlProcess = spawn('yt-dlp', args);
+		let errorOutput = '';
+		dlProcess.stderr.on('data', data => {
+			errorOutput += data.toString();
+		});
+		dlProcess.on('close', (code) => {
+			if (code !== 0) {
+				log.error(`Error downloading video ${url}: ${errorOutput.trim()}`);
+				reject(new Error(`Download failed for ${url}`));
 			} else {
+				log.info(`Download completed: ${outputPath}`);
 				resolve(outputPath);
 			}
 		});
 	});
 }
 
-// Get list of all videos from the channel
+// **Fetch list of videos from the channel**
 async function getChannelVideos() {
 	try {
 		const response = await youtube.search.list({
@@ -96,54 +131,53 @@ async function getChannelVideos() {
 			type: 'video',
 			order: 'date'
 		});
+		if (!response.data || !response.data.items) {
+			throw new Error('No data returned from YouTube API');
+		}
 		const videoIds = response.data.items.map(item => item.id.videoId);
 		const videoDetails = await getVideoDetails(videoIds);
-
-		// Фильтрация: исключаем короткие видео (Shorts) и подкасты
-		return videoDetails.filter(video => {
+		const filtered = videoDetails.filter(video => {
 			const durationSec = parseDuration(video.duration);
-			// Если длительность меньше 60 секунд, считаем видео шортом
-			if (durationSec < 60) return false;
-			if (durationSec > 300) return false;
-
-			// Если в названии содержится слово "подкаст" или "podcast" (без учёта регистра) – исключаем
+			if (durationSec < 60 || durationSec > 300) return false;
 			const titleLower = video.title.toLowerCase();
 			if (titleLower.includes('live') || titleLower.includes('podcast')) return false;
-
-			// Остальные видео оставляем
 			return true;
 		});
+		log.info(`Fetched ${filtered.length} videos from channel`);
+		return filtered;
 	} catch (error) {
-		console.error('Error fetching video list:', error);
+		log.error('Error fetching video list from YouTube API:', error);
 		return [];
 	}
 }
 
-// Get detailed information about videos
+// **Get detailed information about videos**
 async function getVideoDetails(videoIds) {
 	try {
 		const response = await youtube.videos.list({
 			part: 'contentDetails,snippet',
 			id: videoIds.join(',')
 		});
+		if (!response.data || !response.data.items) {
+			throw new Error('No video details returned from YouTube API');
+		}
 		return response.data.items.map(item => ({
 			url: `https://www.youtube.com/watch?v=${item.id}`,
 			title: item.snippet.title,
 			duration: item.contentDetails.duration || 'PT0S'
 		}));
 	} catch (error) {
-		console.error('Error fetching video details:', error);
+		log.error('Error fetching video details from YouTube API:', error);
 		return [];
 	}
 }
 
-// Parse ISO 8601 duration or other formats into seconds
+// **Parse ISO 8601 duration into seconds**
 function parseDuration(duration) {
 	if (!duration || typeof duration !== 'string') {
-		console.warn('Invalid duration format, returning 0:', duration);
+		log.warn('Invalid duration format, defaulting to 0:', duration);
 		return 0;
 	}
-
 	const match = duration.match(/PT(\d+H)?(\d+M)?(\d+S)?/);
 	if (match) {
 		const hours = parseInt(match[1]) || 0;
@@ -151,17 +185,15 @@ function parseDuration(duration) {
 		const seconds = parseInt(match[3]) || 0;
 		return hours * 3600 + minutes * 60 + seconds;
 	}
-
 	if (duration === 'P0D' || duration.startsWith('P')) {
-		console.warn('Non-standard duration format, returning 0:', duration);
+		log.warn('Non-standard duration format, defaulting to 0:', duration);
 		return 0;
 	}
-
-	console.warn('Failed to parse duration, returning 0:', duration);
+	log.warn('Failed to parse duration, defaulting to 0:', duration);
 	return 0;
 }
 
-// Shuffle an array (Fisher-Yates algorithm)
+// **Shuffle an array using the Fisher-Yates algorithm**
 function shuffleArray(array) {
 	for (let i = array.length - 1; i > 0; i--) {
 		const j = Math.floor(Math.random() * (i + 1));
@@ -170,60 +202,77 @@ function shuffleArray(array) {
 	return array;
 }
 
-// Create stream
+// **Global state for managing streaming**
+let activeDownloadProcess = null;
+let currentFFmpegProcess = null;
+let nextDownloadPromise = null;
+let nextVideoIndex = null;
+let nextVideoPath = null;
+let shuttingDown = false;
+
+// **Main streaming function**
 async function startStreaming() {
 	await ensureTempDir();
 	const videos = await getChannelVideos();
-
 	if (videos.length === 0) {
-		console.error('Failed to fetch videos for streaming');
+		log.error('No videos available for streaming. Exiting startStreaming.');
 		return;
 	}
 
-	const playlist = await Promise.all(videos.map(async video => {
-		let duration = parseDuration(video.duration);
-		if (duration === 0) {
-			duration = await getVideoDuration(video.url) || 30;
+	// Prepare playlist with determined durations
+	const playlist = [];
+	for (const video of videos) {
+		let durationSec = parseDuration(video.duration);
+		if (durationSec === 0) {
+			durationSec = await getVideoDuration(video.url) || 30;
 		}
-		return {
+		playlist.push({
 			url: video.url,
 			title: video.title,
-			duration
-		};
-	}));
+			duration: durationSec
+		});
+	}
 
-	// Shuffle playlist
+	// Shuffle playlist for random order
 	const shuffledPlaylist = shuffleArray([...playlist]);
+	log.info(`Playlist prepared with ${shuffledPlaylist.length} videos. Starting stream...`);
 
 	async function streamVideos(index = 0, retries = 3) {
+		if (shuttingDown) {
+			log.warn('Streaming halted due to shutdown request.');
+			return;
+		}
 		if (index >= shuffledPlaylist.length) {
+			log.info('Reached end of playlist, looping back to start.');
 			return streamVideos(0, retries);
 		}
 
 		const currentVideo = shuffledPlaylist[index];
-		const currentFile = path.join(TEMP_DIR, `video_${index}_${Date.now()}.mkv`);
-		console.log(`Now streaming: ${currentVideo.title} (${currentVideo.url})`);
-		console.log(`File: ${currentFile}`);
-		console.log(`Preliminary video duration: ${currentVideo.duration} seconds`);
+		const currentFile = path.join(TEMP_DIR, `video_${index}.mkv`);
+		log.info(`\n=== Now streaming: "${currentVideo.title}" (${currentVideo.url}) ===`);
+		log.info(`Target file: ${currentFile}`);
+		log.info(`Planned video duration: ${currentVideo.duration} seconds`);
 
 		let attempt = 0;
-
 		async function tryDownloadAndStream() {
 			try {
-				// Clean up before download
 				await fs.unlink(currentFile).catch(() => {});
-
-				// Download current video
-				await downloadVideo(currentVideo.url, currentFile);
-
-				// Get exact duration from file
+				if (nextDownloadPromise && nextVideoIndex === index) {
+					log.info(`Using preloaded file for video at index ${index}`);
+					await nextDownloadPromise;
+					nextDownloadPromise = null;
+				} else {
+					log.info(`Downloading video: ${currentVideo.url}`);
+					activeDownloadProcess = null;
+					const outputPath = await downloadVideo(currentVideo.url, currentFile);
+					activeDownloadProcess = null;
+				}
 				const accurateDuration = await getFileDuration(currentFile);
-				console.log(`Exact video duration: ${accurateDuration} seconds`);
+				log.info(`Exact video duration (from file): ${accurateDuration} seconds`);
 
-				// Stream current video
 				const startTime = Date.now();
-				await new Promise((resolve) => {
-					const proc = ffmpeg(currentFile)
+				await new Promise((resolve, reject) => {
+					const command = ffmpeg(currentFile)
 						.inputOptions('-re')
 						.outputOptions([
 							'-c:v libx264',
@@ -235,56 +284,79 @@ async function startStreaming() {
 							'-b:a 128k',
 							'-f flv'
 						])
-						.output(RTMP_URL)
-						.on('error', (err) => {
-							console.error('FFmpeg error:', err.message);
-							resolve();
-						})
-						.on('end', () => {
-							resolve();
-						});
+						.output(RTMP_URL);
 
-					proc.run();
+					command.on('error', (err) => {
+						log.error('FFmpeg error during streaming:', err.message);
+						resolve();
+					});
+					command.on('start', (cmdLine) => {
+						log.info('FFmpeg process started:', cmdLine);
+					});
+					command.on('end', () => {
+						log.info('FFmpeg process ended normally for video:', currentVideo.url);
+						resolve();
+					});
 
-					// Preload next video after streaming starts
-					if (index + 1 < shuffledPlaylist.length) {
-						const nextVideo = shuffledPlaylist[index + 1];
-						const nextFile = path.join(TEMP_DIR, `video_${index + 1}_${Date.now()}.mkv`);
-						downloadVideo(nextVideo.url, nextFile).catch(err => {
-							console.error(`Error preloading next video (${nextVideo.url}):`, err);
+					currentFFmpegProcess = command;
+					command.run();
+
+					if (shuttingDown) return;
+					let nextIndex = (index + 1) % shuffledPlaylist.length;
+					if (shuffledPlaylist.length > 0 && nextIndex !== index) {
+						const nextVideo = shuffledPlaylist[nextIndex];
+						nextVideoIndex = nextIndex;
+						nextVideoPath = path.join(TEMP_DIR, `video_${nextIndex}.mkv`);
+						log.info(`Preloading next video: "${nextVideo.title}" at index ${nextIndex}`);
+						nextDownloadPromise = downloadVideo(nextVideo.url, nextVideoPath).catch(err => {
+							log.error(`Error preloading next video ${nextVideo.url}: ${err.message}`);
+							throw err;
 						});
 					}
 				});
 
-				// Wait for the full video duration
 				const elapsedTime = (Date.now() - startTime) / 1000;
 				const remainingTime = Math.max(accurateDuration - elapsedTime, 0);
-				if (remainingTime > 0) {
-					console.log(`Waiting for playback to complete: ${remainingTime} seconds`);
-					await new Promise(resolve => setTimeout(resolve, remainingTime * 1000));
+				if (remainingTime > 1) {
+					log.info(`Waiting ${remainingTime.toFixed(2)} seconds to synchronize with video duration`);
+					await new Promise(res => setTimeout(res, remainingTime * 1000));
 				} else {
-					console.log('Playback finished earlier than expected');
+					log.info('No synchronization wait needed (playback duration met or exceeded expected length)');
 				}
 
-				console.log(`Switching to next video after ${elapsedTime} seconds of playback`);
-
-				// Remove current file after streaming
-				await fs.unlink(currentFile).catch(err => console.error('Error deleting file:', err));
-
-				// Proceed to next video
+				await fs.unlink(currentFile).catch(err => log.error('Error deleting temp file:', err));
+				log.info(`Finished streaming "${currentVideo.title}". Moving to next video...`);
 				await streamVideos(index + 1, retries);
 			} catch (error) {
 				attempt++;
 				if (attempt < retries) {
-					console.warn(`Attempt ${attempt + 1} of ${retries} for video (${currentVideo.url})`);
+					log.warn(`Attempt ${attempt} failed for video ${currentVideo.url}. Retrying (attempt ${attempt + 1} of ${retries})...`);
+					if (nextDownloadPromise && nextVideoIndex === index + 1) {
+						if (activeDownloadProcess) {
+							try {
+								activeDownloadProcess.kill();
+								log.warn('Aborted preloading of next video due to retry.');
+							} catch (killErr) {
+								log.error('Error aborting preloading process:', killErr);
+							}
+						}
+						if (nextVideoPath) {
+							await fs.unlink(nextVideoPath).catch(() => {});
+						}
+						nextDownloadPromise = null;
+						nextVideoIndex = null;
+						nextVideoPath = null;
+					}
 					await fs.unlink(currentFile).catch(() => {});
-					await new Promise(resolve => setTimeout(resolve, 10000));
+					await new Promise(res => setTimeout(res, 10000));
 					await tryDownloadAndStream();
 				} else {
-					console.error('All attempts exhausted, skipping video:', currentVideo.url);
+					log.error(`All ${retries} attempts failed for video: ${currentVideo.url}. Skipping this video.`);
 					await fs.unlink(currentFile).catch(() => {});
 					await streamVideos(index + 1, retries);
 				}
+			} finally {
+				currentFFmpegProcess = null;
 			}
 		}
 
@@ -294,7 +366,44 @@ async function startStreaming() {
 	await streamVideos(0);
 }
 
-// Start server
-app.listen(3000, () => {
-	startStreaming();
+// **Start the Express server and streaming**
+const server = app.listen(3000, () => {
+	log.info('Express server is running on port 3000. Starting RTMP streaming...');
+	startStreaming().catch(err => {
+		log.error('Unhandled error in startStreaming:', err);
+	});
 });
+
+// **Graceful shutdown handling**
+async function gracefulShutdown() {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	log.warn('Received shutdown signal. Shutting down gracefully...');
+	server.close(() => {
+		log.info('HTTP server closed.');
+	});
+	if (currentFFmpegProcess) {
+		try {
+			currentFFmpegProcess.kill('SIGINT');
+			log.info('Sent SIGINT to FFmpeg process.');
+		} catch (err) {
+			log.error('Error sending SIGINT to FFmpeg process:', err);
+		}
+	}
+	if (activeDownloadProcess) {
+		try {
+			activeDownloadProcess.kill('SIGINT');
+			log.info('Terminated active download process.');
+		} catch (err) {
+			log.error('Error terminating download process:', err);
+		}
+	}
+	setTimeout(async () => {
+		await ensureTempDir().catch(() => {});
+		log.info('Temporary files cleaned up. Exiting now.');
+		process.exit(0);
+	}, 5000).unref();
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
