@@ -254,20 +254,18 @@ async function startStreaming() {
 		log.info(`Planned video duration: ${currentVideo.duration} seconds`);
 
 		async function tryDownloadAndStream() {
-			// Определяем путь для текущего видео
-			let currentFile = path.join(TEMP_DIR, `video_${index}.mkv`);
+			// Генерируем уникальное имя файла для текущего видео
+			let currentFile = path.join(TEMP_DIR, `video_${index}_${Date.now()}.mkv`);
 
 			if (nextDownloadPromise && nextVideoIndex === index) {
 				log.info(`Using preloaded file for video at index ${index}`);
-				// Если файл был предзагружен, используем именно тот путь
 				currentFile = nextVideoPath;
-				// Ждём завершения предзагрузки
 				await nextDownloadPromise;
 				nextDownloadPromise = null;
 				nextVideoIndex = null;
 				nextVideoPath = null;
 			} else {
-				// Если файла нет, пытаемся удалить (игнорируем ошибку ENOENT)
+				// Если файл существует – удаляем его (игнорируем ENOENT)
 				await fs.unlink(currentFile).catch(err => {
 					if (err.code !== 'ENOENT') {
 						log.error('Error deleting temp file before download:', err);
@@ -277,7 +275,15 @@ async function startStreaming() {
 				await downloadVideo(currentVideo.url, currentFile);
 			}
 
-			// Определяем точную длительность файла
+			// Проверяем, что файл действительно существует; если нет – повторно скачиваем
+			try {
+				await fs.access(currentFile);
+			} catch (err) {
+				log.warn(`File ${currentFile} not found. Re-downloading.`);
+				await downloadVideo(currentVideo.url, currentFile);
+			}
+
+			// Получаем точную длительность файла
 			const accurateDuration = await getFileDuration(currentFile);
 			log.info(`Exact video duration (from file): ${accurateDuration} seconds`);
 
@@ -312,13 +318,14 @@ async function startStreaming() {
 				currentFFmpegProcess = command;
 				command.run();
 
-				// Если не происходит завершения приложения, предзагружаем следующее видео
+				// Предзагрузка следующего видео (с уникальным именем)
 				if (!shuttingDown) {
 					const nextIndex = (index + 1) % shuffledPlaylist.length;
 					if (shuffledPlaylist.length > 0 && nextIndex !== index) {
 						const nextVideo = shuffledPlaylist[nextIndex];
 						nextVideoIndex = nextIndex;
-						nextVideoPath = path.join(TEMP_DIR, `video_${nextIndex}.mkv`);
+						// Генерируем уникальное имя для предзагруженного файла
+						nextVideoPath = path.join(TEMP_DIR, `video_${nextIndex}_${Date.now()}.mkv`);
 						log.info(`Preloading next video: "${nextVideo.title}" at index ${nextIndex}`);
 						nextDownloadPromise = downloadVideo(nextVideo.url, nextVideoPath).catch(err => {
 							log.error(`Error preloading next video ${nextVideo.url}: ${err.message}`);
@@ -337,7 +344,7 @@ async function startStreaming() {
 				log.info('No synchronization wait needed (playback duration met or exceeded expected length)');
 			}
 
-			// Удаляем файл после стриминга, игнорируя ошибку, если файл не найден
+			// После успешного стриминга удаляем файл; ошибки ENOENT игнорируем
 			await fs.unlink(currentFile).catch(err => {
 				if (err.code !== 'ENOENT') {
 					log.error('Error deleting temp file:', err);
@@ -346,7 +353,6 @@ async function startStreaming() {
 			log.info(`Finished streaming "${currentVideo.title}". Moving to next video...`);
 			await streamVideos(index + 1, retries);
 		}
-
 
 		await tryDownloadAndStream();
 	}
